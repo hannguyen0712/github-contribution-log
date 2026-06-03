@@ -1,8 +1,11 @@
 # Contribution #1: Langfuse integration
 
 **Contribution Number:** 1
+
 **Student:** Han Nguyen  
+
 **Issue:** [\[GitHub issue link\]  ](https://github.com/apache/burr/issues/206#event-26164144705)
+
 **Status:** Phase 1 - Complete
 
 ---

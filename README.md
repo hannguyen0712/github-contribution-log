@@ -12,8 +12,6 @@
 
 ## Why I Chose This Issue
 
-[1-2 paragraphs explaining why this issue interests you, how it matches your skills/learning goals, what you hope to learn]
-
 I chose this issue since I am looking to build AI engineering and software engineering skills. I have taken relevant courses at university, and I'm looking to put the skills into practice. The issue involves a trace-based Langfuse integration for Burr, and Burr's hook system makes it a clean place to learn how to map an application's execution model (runs, steps, state reads and writes) onto an external tracing model built on OpenTelemetry, and I am drawn to the design judgment the maintainer flagged: deciding what belongs in a span, how to represent state observations, and where to draw the line between a minimal first version and the richer features layered on top.
 
 What I hope to get out of it is depth in LLM observability and OpenTelemetry specifically, which is a skill set I expect to matter more and more as agent systems move from demos into things people actually deploy. I want to learn how a mature framework like Burr structures its tracking client so that a new integration follows existing patterns rather than fighting them, and I want practice scoping a net-new feature into a reviewable first PR with tests and an example, then iterating with a maintainer rather than dropping a single large change. Contributing to an Apache project also gives me a chance to work on a real review bar, which is the part of open source I find most valuable.

@@ -6,7 +6,7 @@
 
 **Issue:** [\[Langfuse Integration\]  ](https://github.com/apache/burr/issues/206#event-26164144705)
 
-**Status:** Phase 1 - Complete. Phase 2 - In progress. Phase 3 - Have not started.
+**Status:** Phase 1 - Complete. Phase 2 - Complete. Phase 3 - In progress.
 
 ---
 
@@ -43,19 +43,34 @@ The integration centers on Burr's hook system (the lifecycle hooks that fire on 
 
 ### Environment Setup
 
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
+I set up the development environment on macOS (Apple Silicon). It took a few iterations to get a clean dev install, and a couple of the issues are worth recording since another contributor on macOS is likely to hit the same ones.
 
-### Steps to Reproduce
+My first attempt used the system Python 3.9 from the Xcode command line tools, and Burr failed to launch on import because `burr/cli/__main__.py` uses `dict | None` union syntax in a runtime-evaluated annotation, which only works on Python 3.10+. Burr's contributing docs state it supports Python 3.9, so this is a genuine incompatibility (tracked separately as a candidate bug). I moved to Python 3.12 via Homebrew and installed Burr in editable mode from a clone, using the `[developer]` extra the contributing guide specifies, which adds the test runner and pre-commit hooks.
 
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+```bash
+brew install python@3.12
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[developer]"
+```
 
-### Reproduction Evidence
+Installing from a clone with `-e` rather than the published wheel matters here, since the integration work means editing source and needing those changes picked up immediately. With that in place I confirmed the environment by running `hello-world-counter` end to end and watching the run land in Burr's telemetry UI. Working through the example also clarified how Burr separates its two state stores, the persister and the tracker, and how its lifecycle hooks fire on application and step boundaries. That hook surface is exactly what this contribution attaches to, so the setup doubled as orientation for the actual work.
 
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
+### Baseline Behavior (Current State)
+
+Since this is a net-new feature rather than a bug, there is no failing case to reproduce. The baseline is the absence of the integration: with a standard Burr install, there is no way to send execution traces to Langfuse. To confirm the gap, I attached Burr's existing tracking client to an app and verified that run and step data flows to Burr's own telemetry UI, but that no path exists to forward that same execution data (run boundaries, per-step execution, state reads and writes) to Langfuse without writing custom glue. This establishes both what Burr already exposes through its hooks and what the integration needs to add.
+
+### Local Build Evidence 
+- **Fork:** [Link to commit in your fork]
+- **Screenshots/logs:** 
+<img width="3020" height="1804" alt="image" src="https://github.com/user-attachments/assets/652cc224-b212-4f11-9c63-c6ec5b9404c7" />
+<img width="2176" height="986" alt="image" src="https://github.com/user-attachments/assets/c7ca7295-7e37-4089-ac37-4825137365b4" />
+
+### Findings
+
+- Burr's hook system surfaces everything the integration needs: application-level boundaries for the trace, step-level boundaries for spans, and state I/O for observations.
+- The existing tracking client is the right pattern to mirror, confirmed by the maintainer in the issue.
+- An OpenTelemetry-based approach is acceptable, so existing OTel support is something to build on rather than duplicate.
 
 ---
 

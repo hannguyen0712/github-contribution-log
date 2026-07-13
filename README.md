@@ -77,104 +77,122 @@ Since this is a net-new feature rather than a bug, there is no failing case to r
 ## Solution Approach
 
 ### Analysis
-
-[Your analysis of the root cause - what's causing the issue?]
+This is a design problem rather than a root-cause problem, and the design landscape shifted meaningfully between the issue being filed (May 2024) and my picking it up. The original proposal was a dedicated Langfuse client mirroring `burr/tracking/client.py`, with the Langfuse client passed in as a runtime input, which depended on issue #205 (global inputs). #205 was closed as not planned, and in the meantime the Langfuse Python SDK was rebuilt on OpenTelemetry (v3 in mid-2025, currently v4.14). The v3+/v4 SDK registers a span processor on the global OTel tracer provider, which means any spans emitted through standard OTel tracers flow to Langfuse automatically, and Burr already has an `OpenTelemetryBridge` lifecycle hook that maps runs, steps, and tracer spans onto OTel spans. So the analysis reduced to: the integration should be a thin, Langfuse-aware layer over the existing OTel bridge, not a parallel client. This matches the direction I proposed on the issue and that the maintainer approved.
+ 
+Two non-obvious discoveries came out of reading the actual SDK source rather than just the docs:
+ 
+1. **Langfuse v4 silently drops unknown spans.** The v4 SDK applies a default export filter (`is_default_export_span`) that only keeps spans created by the Langfuse SDK tracer, spans carrying `gen_ai.*` attributes, or spans from a hardcoded allowlist of known LLM instrumentors. Raw Burr spans match none of these, so a naive bridge would produce zero traces in the UI with no error anywhere. The fix is to inject a custom `should_export_span` filter into the Langfuse client that extends the default with Burr's tracer scope (with a graceful fallback on v3, where everything exports by default).
+2. **A pre-existing bug in Burr core.** While testing error propagation I found that `_call_execute_method_pre_post` in `burr/core/application.py` initializes `exc = None` inside a `try/finally` with no `except` clause, so the `post_run_execute_call` hook *always* receives `exception=None`. This means even the existing `OpenTelemetryBridge` never marks a root span as errored when a run fails. The fix is four lines in each of the sync and async wrappers (`except BaseException as e: exc = e; raise`), and it directly matters for this integration since "errors recorded on the trace" is part of the expected behavior.
 
 ### Proposed Solution
-
-[High-level description of your fix approach]
-
+A `LangfuseBridge` class in `burr/integrations/langfuse.py` that subclasses `OpenTelemetryBridge` and is attached via `.with_hooks(LangfuseBridge())`. It delivers everything the issue asked for:
+ 
+- **One trace per application execution call** (`run`/`step`/`iterate`/`stream_result`/...), rooted at the `pre_run_execute_call` hook.
+- **One span per step**, with the action's inputs and read state captured as the Langfuse observation input, and its result and written state as the observation output (using Burr's `serde` for serialization, and filtering out internal dunder inputs like `__tracer`).
+- **One span per tracer span** opened through Burr's `__tracer` API, inherited from the parent bridge.
+- **Observations at will**: attributes logged via `__tracer.log_attributes()` land as Langfuse observation metadata (with `langfuse.*` and `gen_ai.*` keys passed through unprefixed so users can deliberately set mapped attributes).
+- **Access to the Langfuse client** via `bridge.langfuse_client`, e.g. for `flush()` in short-lived scripts or for scoring traces.
+Two Burr-to-Langfuse mappings fell out naturally: `app_id` maps to the Langfuse session (so multiple execution calls of one application group together) and `partition_key` maps to the Langfuse user, both overridable via constructor args. These attributes are set on every span, not just the root, because Langfuse's session/user aggregations operate per-observation. A `capture_state=False` flag turns off state capture for applications with sensitive state, and `burr_span_export_filter` is exported publicly for users who construct their own `Langfuse` client. Because everything rides on the global OTel provider, any third-party LLM instrumentor (e.g. `opentelemetry-instrumentation-openai`) automatically appears as generations nested inside the correct Burr step spans, with prompts, completions, and token usage.
+ 
+The core `application.py` exception-propagation fix is included with its own regression tests, clearly flagged for the maintainer since it touches core and he may prefer it split into a separate small PR.
+ 
 ### Implementation Plan
-
 Using UMPIRE framework (adapted):
-
-**Understand:** [Restate the problem]
-
-**Match:** [What similar patterns/solutions exist in the codebase?]
-
-**Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
-
-**Implement:** [Link to your branch/commits as you work]
-
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
-
-**Evaluate:** [How will you verify it works?]
-
+**Understand:** Burr needs a hooks-based integration that maps its execution model onto Langfuse's trace model: execution call → trace, step → span, tracer span → nested span, state I/O → observation input/output, logged attributes → metadata, with the Langfuse client accessible and errors recorded.
+**Match:** `OpenTelemetryBridge` in `burr/integrations/opentelemetry.py` already solves the hard span-lifecycle problems (context token stack, enter/exit pairing across hooks, error status). The traceloop integration shows the docs pattern for OTel-vendor pages; `require_plugin` in `burr/integrations/base.py` is the standard optional-dependency guard; `tests/integrations/test_burr_opentelemetry.py` sets the test style; `examples/integrations/` is the home for integration examples (exempt from the notebook/statemachine.png requirements in `validate_examples.py`).
+**Plan:**
+1. Add `burr/integrations/langfuse.py` with `LangfuseBridge(OpenTelemetryBridge)`, `burr_span_export_filter`, and serialization helpers.
+2. Override `pre/post_run_execute_call`, `pre/post_run_step`, `pre_start_span`, and `do_log_attributes` to layer Langfuse attributes (`langfuse.observation.input/output`, `langfuse.observation.metadata.*`, `langfuse.session.id`, `langfuse.user.id`) onto the parent's span handling.
+3. Fix the `exc = None` bug in both wrappers of `_call_execute_method_pre_post` in `burr/core/application.py`.
+4. Add `tests/integrations/test_burr_langfuse.py` plus two regression tests in `tests/core/test_application.py`.
+5. Add the `langfuse` extra to `pyproject.toml` (and to the `tests` extra), `docs/reference/integrations/langfuse.rst` wired into the integrations index, and a runnable example under `examples/integrations/langfuse/`.
+**Implement:** Complete locally; patch prepared against main. [Link to branch/commits once pushed to fork.]
+**Review:** Formatted and linted with the repo's pre-commit tooling (black 23.11 at line length 100, isort with the black profile, flake8) — all clean. ASF license headers on every new file. Docs page follows the traceloop/opentelemetry RST structure. Example placed where `validate_examples.py` permits a README + application.py without a notebook.
+**Evaluate:** Automated tests assert the full span tree and attributes against an in-memory OTel exporter (no credentials needed); manual verification runs the example against a free Langfuse Cloud project to confirm the trace renders correctly in their UI, since the automated tests mock the Langfuse client itself.
 ---
 
 ## Testing Strategy
 
 ### Unit Tests
-
-- [ ] Test case 1: [Description]
-- [ ] Test case 2: [Description]
-- [ ] Test case 3: [Description]
-
+- [x] `test_burr_span_export_filter`: Burr-scoped spans pass the export filter, and spans matching Langfuse's default criteria (e.g. `gen_ai.*`) still pass.
+- [x] `test_langfuse_bridge_rejects_client_and_kwargs`: passing both a pre-constructed client and constructor kwargs raises `ValueError`.
+- [x] Core regression (sync + async): `post_run_execute_call` receives the actual exception when a step raises (`test_app_step_broken_calls_post_run_execute_call_with_exception` and the `astep` variant in `tests/core/test_application.py`).
 ### Integration Tests
-
-- [ ] Integration scenario 1
-- [ ] Integration scenario 2
-
+All run a real two-action Burr app (with a tracer span and logged attributes) against an in-memory OTel `TracerProvider`/`InMemorySpanExporter` with a mocked Langfuse client, so no network or credentials are needed in CI:
+- [x] `test_langfuse_bridge_span_structure_and_attributes`: one root span per `run` call, step spans parented to the root, tracer span parented to its step, all in one trace; session/user attributes on every span; step observation input contains action inputs and read state (with `__tracer` filtered out); step output contains result and written state; trace-level output reflects final application state; `__tracer.log_attributes` lands in observation metadata.
+- [x] `test_langfuse_bridge_capture_state_false`: no observation input/output attributes anywhere when state capture is disabled.
+- [x] `test_langfuse_bridge_session_and_user_overrides`: explicit `session_id`/`user_id` override the `app_id`/`partition_key` defaults.
+- [x] `test_langfuse_bridge_records_exceptions`: a raising action marks both the step span and the root span as errored (this is what surfaced the core bug).
+Results: 6/6 new integration tests pass; 400/400 across `tests/core`, `tests/visibility`, and the OTel/pydantic integration tests (including 139 in `tests/core/test_application.py` with the two new regression tests).
 ### Manual Testing
-
-[What you tested manually and results]
-
+In progress. The automated tests exercise the bridge against a real OTel pipeline but mock the Langfuse client, so they can't confirm how Langfuse's backend ingests and renders the spans. I'm running `examples/integrations/langfuse/application.py` against a free Langfuse Cloud project (with `opentelemetry-instrumentation-openai` installed) to verify: (1) one trace appears per `.run()` call, (2) the trace tree shows steps → tracer spans → OpenAI generations nested correctly, (3) observation input/output and metadata render as expected, (4) the session and user views group traces by `app_id`/`partition_key`, and (5) a forced error shows up on the trace. Screenshots of the Langfuse trace view will go here for the PR description.
 ---
 
 ## Implementation Notes
 
-### Week [X] Progress
+### May 31 — Scoping
+Commented on the issue proposing the OTel-based direction instead of the original dedicated-client approach (which depended on the closed #205), and scoped a focused first PR: one trace per run, one span per step, state observations, plus example and docs, with follow-ups for anything beyond. Maintainer (@elijahbenizzy) replied same day: "Can work both ways -- up to you," and confirmed we can get around #205.
 
-[What you built this week, challenges faced, decisions made]
+### July 1-12 — Implementation
+Surveyed the codebase (`OpenTelemetryBridge`, lifecycle hook signatures, the traceloop docs pattern, test conventions, `validate_examples.py` rules) and verified the current Langfuse SDK against the real package rather than docs — which is how I caught that the SDK is now v4.14 (docs and the issue thread still talk about v3) and that v4's default export filter would silently drop Burr spans. Implemented `LangfuseBridge`, the export filter, tests, docs, the example, and the pyproject extra. Testing error propagation surfaced the `post_run_execute_call` exception bug in core; fixed it in both wrappers with regression tests. First test run also caught that Burr injects `__tracer` into action inputs, which was leaking framework internals into the serialized observation input — added dunder filtering. All formatting/linting clean per the repo's pre-commit config.
 
-### Week [Y] Progress
-
-[Continue documenting as you work]
+### Next
+Manual verification against Langfuse Cloud (in progress), then push the branch, open the PR with the core fix clearly flagged (offering to split it out if preferred), and update the issue thread noting the v4 SDK landscape.
 
 ### Code Changes
-
-- **Files modified:** [List]
-- **Key commits:** [Links to important commits]
-- **Approach decisions:** [Why you chose certain approaches]
-
+- **Files added:** `burr/integrations/langfuse.py`, `tests/integrations/test_burr_langfuse.py`, `docs/reference/integrations/langfuse.rst`, `examples/integrations/langfuse/{__init__.py,application.py,README.md}`
+- **Files modified:** `burr/core/application.py` (exception propagation fix), `tests/core/test_application.py` (2 regression tests), `pyproject.toml` (`langfuse` extra + tests extra), `docs/reference/integrations/index.rst` (toctree entry)
+- **Key commits:** [Links once pushed to fork]
+- **Approach decisions:**
+  - *Subclass `OpenTelemetryBridge` instead of a standalone client:* the SDK's OTel-native rewrite means Langfuse ingests standard OTel spans off the global provider, so a parallel client following `tracking/client.py` would duplicate the bridge's span-lifecycle machinery and lose free nesting of third-party LLM instrumentor spans.
+  - *Inject `should_export_span` rather than spoof the Langfuse tracer scope:* naming our tracer `langfuse-sdk` would pass the filter but misrepresent the spans to Langfuse's mapping layer; extending the filter is the documented, public mechanism, and only relying on public API (I deliberately avoided the private `_otel_span` on Langfuse's span wrappers).
+  - *`app_id` → session, `partition_key` → user:* Burr's own docs treat partition_key as a per-user key, and sessions grouping multiple runs of one app instance matches Langfuse's session semantics; both are constructor-overridable, and set on every span because Langfuse aggregates these per-observation.
+  - *`capture_state` flag:* state can contain sensitive data; the integration shouldn't force users to ship it to a third party to get tracing.
+  - *Include the core fix in this PR but flag it:* it's 8 lines plus tests and is required for correct error status on traces, but it touches `application.py`, so the maintainer gets an explicit offer to split it into its own PR.
 ---
-
 ## Pull Request
-
 **PR Link:** [GitHub PR URL when submitted]
-
-**PR Description:** [Draft or final PR description - much of the content above can be adapted]
-
+**PR Description (draft):**
+> Implements #206: a Langfuse integration built on the OpenTelemetry-native Langfuse Python SDK, as discussed in the issue thread. Adds `LangfuseBridge` (subclassing `OpenTelemetryBridge`, attached via `with_hooks`) providing one trace per execution call, one span per step, one span per tracer span, state/inputs/results as observation input/output, logged attributes as observation metadata, and public access to the Langfuse client. `app_id`/`partition_key` map to Langfuse session/user (overridable); `capture_state=False` disables state capture. Includes tests, docs, an example, and a `langfuse` extra.
+>
+> Two things reviewers should know: (1) Langfuse SDK v4 filters span export to LLM-relevant spans by default, so the bridge injects a `should_export_span` filter (exported as `burr_span_export_filter` for users constructing their own client), with a fallback for v3. (2) This PR includes a small core fix: `_call_execute_method_pre_post` never captured the raised exception, so `post_run_execute_call` hooks always received `exception=None` — meaning the existing OTel bridge never marked failed runs as errored. Fixed in both sync/async wrappers with regression tests. Happy to split this into a separate PR if preferred.
+ 
 **Maintainer Feedback:**
 - [Date]: [Summary of feedback received]
 - [Date]: [How you addressed it]
-
-**Status:** [Awaiting review / Iterating / Approved / Merged]
-
+**Status:** Preparing PR (manual verification in progress)
 ---
-
 ## Learnings & Reflections
-
 ### Technical Skills Gained
-
-[What you learned technically]
-
+- How OpenTelemetry context propagation actually works under the hood: tracer providers, span processors, export filters, and the token/attach/detach mechanics Burr's bridge uses to pair spans across non-context-manager hook boundaries.
+- Reading a dependency's source instead of trusting its docs: the v4 export filter behavior and the exact `should_export_span` mechanism weren't findable from documentation alone, and pip-installing the SDK to inspect `_client/span_filter.py` and the `Langfuse` constructor signature resolved in minutes what could have been a mystifying "no traces appear" failure later.
+- Langfuse's OTel attribute mapping (`langfuse.observation.input/output`, `langfuse.observation.metadata.*`, `langfuse.session.id`, `langfuse.user.id`) and the per-observation attribute requirement for session/user aggregations.
+- Testing tracing integrations hermetically with `InMemorySpanExporter` and an isolated `TracerProvider`, asserting on the full span tree rather than just "it didn't crash."
 ### Challenges Overcome
-
-[What was hard and how you solved it]
-
+- The design target had drifted since 2024: the original approach depended on a closed issue and predated Langfuse's OTel rewrite. Re-scoping on the issue thread before writing code, and getting maintainer sign-off on the new direction, meant the implementation didn't fight the current SDK.
+- A failing exception test turned out to be a bug in Burr core, not my code. Tracing it from "root span shows OK" through the hook invocation path to the `try/finally` with no `except` was a good exercise in not assuming the framework is right, and in deciding how a first-time contributor should handle a core fix inside a feature PR (include it, test it, flag it, offer to split).
+- My own first version leaked Burr's internal `__tracer` object into the serialized observation input — caught by the very first test run, which reinforced writing the assertions on exact payload contents.
 ### What I'd Do Differently Next Time
-
-[Reflection on your process]
-
+Verify the current state of the external dependency *before* scoping the work in the issue comment, not after: my May 31 comment said "Langfuse now ingests OpenTelemetry natively" based on v3, and the v4 filter behavior would have been worth mentioning then. Also, I'd start from the framework's existing tests earlier — reading `test_burr_opentelemetry.py` first would have saved some time reverse-engineering hook signatures from `lifecycle/base.py`.
 ---
 
 ## Resources Used
+- [Burr hooks concept docs](https://burr.dagworks.io/concepts/hooks/)
+- [Burr OpenTelemetry integration reference](https://burr.apache.org/reference/integrations/opentelemetry/) and `examples/opentelemetry/`
+- [Langfuse OpenTelemetry integration guide](https://langfuse.com/integrations/native/opentelemetry) (attribute mapping)
+- [Langfuse SDK overview](https://langfuse.com/docs/observability/sdk/overview) and [existing-OTel-setup FAQ](https://langfuse.com/faq/all/existing-otel-setup) (export filtering, global tracer provider)
+- [Langfuse Python SDK v3 announcement](https://langfuse.com/changelog/2025-05-23-otel-based-python-sdk) — context for the OTel rewrite
+- Langfuse SDK source (`langfuse/_client/span_filter.py`, client constructor) via local install — the export-filter discovery
+- [Issue #206](https://github.com/apache/burr/issues/206), [#205 (closed)](https://github.com/apache/burr/issues/205), [#203](https://github.com/apache/burr/issues/203)
+- Hamilton's Datadog plugin (`h_ddog.py`), referenced in the issue as inspiration for the original design
 
-- [Link to helpful documentation]
-- [Tutorial or Stack Overflow post that helped]
-- [GitHub issues or discussions that helped]
+
+
+
+
+
+
+
+
+
 
